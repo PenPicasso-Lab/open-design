@@ -1,5 +1,5 @@
 import { spawn } from "node:child_process";
-import { mkdir, open, writeFile, type FileHandle } from "node:fs/promises";
+import { lstat, mkdir, open, rm, symlink, writeFile, type FileHandle } from "node:fs/promises";
 import path from "node:path";
 
 import { cac } from "cac";
@@ -86,6 +86,18 @@ function output(payload: unknown, options: CliOptions = {}): void {
     return;
   }
   printJson(payload);
+}
+
+function normalizeDisplayUrl(url: string): string {
+  return url.endsWith("/") ? url : `${url}/`;
+}
+
+function colorizeLink(url: string): string {
+  if (process.env.NO_COLOR != null || process.stdout.isTTY !== true) return url;
+  const reset = "\x1b[0m";
+  const cyan = "\x1b[36m";
+  const underline = "\x1b[4m";
+  return `${cyan}${underline}${url}${reset}`;
 }
 
 function asRecord(value: unknown): Record<string, unknown> | null {
@@ -231,6 +243,19 @@ function printRunForegroundResult(started: Partial<Record<ToolDevAppName, unknow
     return;
   }
 
+  const webStatus = asRecord(asRecord(started.web)?.status);
+  const daemonStatus = asRecord(asRecord(started.daemon)?.status);
+  const webUrl = stringField(webStatus ?? {}, "url");
+  const daemonUrl = stringField(daemonStatus ?? {}, "url");
+
+  if (webUrl != null || daemonUrl != null) {
+    process.stdout.write("\n  Open Design dev server ready\n\n");
+    if (webUrl != null) process.stdout.write(`  ➜  Web:    ${colorizeLink(normalizeDisplayUrl(webUrl))}\n`);
+    if (daemonUrl != null) process.stdout.write(`  ➜  Daemon: ${colorizeLink(normalizeDisplayUrl(daemonUrl))}\n`);
+    process.stdout.write("\n  Press Ctrl+C to stop\n\n");
+    return;
+  }
+
   printStartSection(started, "tools-dev run");
   process.stdout.write("Foreground loop is active. Press Ctrl+C to stop.\n");
 }
@@ -251,6 +276,11 @@ function urlPort(url: string): string {
 
 function statusMatchesForcedPort(url: string | null | undefined, forcedPort: number | null): boolean {
   return forcedPort == null || (url != null && urlPort(url) === String(forcedPort));
+}
+
+function prependNodePath(entries: string[], current = process.env.NODE_PATH): string {
+  const existing = current == null || current.length === 0 ? [] : current.split(path.delimiter);
+  return [...entries, ...existing].join(path.delimiter);
 }
 
 async function openAppLog(config: ToolDevConfig, appName: ToolDevAppName): Promise<FileHandle> {
@@ -392,6 +422,7 @@ async function spawnWebRuntime(config: ToolDevConfig, options: CliOptions): Prom
   const logHandle = await openAppLog(config, APP_KEYS.WEB);
 
   try {
+    await ensureWebDevNodeModules(config);
     await writeWebDevTsconfig(config);
     await logHandle.write(`\n[tools-dev] launching web at ${new Date().toISOString()}\n`);
     await logHandle.write(`[tools-dev] proxying web API requests to daemon port ${daemonPort}\n`);
@@ -399,6 +430,10 @@ async function spawnWebRuntime(config: ToolDevConfig, options: CliOptions): Prom
       appName: APP_KEYS.WEB,
       config,
       env: {
+        NODE_PATH: prependNodePath([
+          path.join(config.workspaceRoot, "apps/web/node_modules"),
+          path.join(config.workspaceRoot, "node_modules"),
+        ]),
         [SIDECAR_ENV.DAEMON_PORT]: daemonPort,
         [SIDECAR_ENV.WEB_DIST_DIR]: config.apps.web.nextDistDir,
         [SIDECAR_ENV.WEB_TSCONFIG_PATH]: config.apps.web.nextTsconfigPath,
@@ -423,6 +458,18 @@ async function buildDesktop(config: ToolDevConfig, logHandle: FileHandle): Promi
     env: process.env,
     logFd: logHandle.fd,
   });
+}
+
+async function ensureWebDevNodeModules(config: ToolDevConfig): Promise<void> {
+  const webRuntimeRoot = path.dirname(config.apps.web.nextDistDir);
+  const runtimeNodeModules = path.join(webRuntimeRoot, "node_modules");
+  const webNodeModules = path.join(config.workspaceRoot, "apps/web/node_modules");
+
+  await mkdir(webRuntimeRoot, { recursive: true });
+  const current = await lstat(runtimeNodeModules).catch(() => null);
+  if (current?.isSymbolicLink()) return;
+  if (current != null) await rm(runtimeNodeModules, { force: true, recursive: true });
+  await symlink(webNodeModules, runtimeNodeModules, "dir");
 }
 
 async function writeWebDevTsconfig(config: ToolDevConfig): Promise<void> {
